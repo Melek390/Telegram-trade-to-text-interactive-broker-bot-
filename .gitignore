@@ -1,0 +1,19 @@
+# Environment & secrets
+.env
+*.session
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test scripts
+test_*.py
+
+# Claude settings
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
