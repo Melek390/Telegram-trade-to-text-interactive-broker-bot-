@@ -67,7 +67,7 @@ def progress(d: dict) -> str:
 
 
 def _mkt_line(mkt: dict | None) -> str:
-    """Formats live market data line. Returns empty string if no data."""
+    """Formats market data line. Returns empty string if no data."""
     if not mkt or not mkt.get("success"):
         return ""
     parts = []
@@ -75,8 +75,9 @@ def _mkt_line(mkt: dict | None) -> str:
     if mkt.get("ask")  is not None: parts.append(f"Ask ${mkt['ask']:.2f}")
     if mkt.get("last") is not None: parts.append(f"Last ${mkt['last']:.2f}")
     if not parts:
-        return "Market  :  _no live data_\n"
-    return f"Market  :  {' · '.join(parts)}\n"
+        return "Market  :  _no data_\n"
+    label = "Market ⏱" if mkt.get("delayed") else "Market"
+    return f"{label}  :  {' · '.join(parts)}\n"
 
 
 def _price_line(d: dict) -> str:

@@ -386,7 +386,11 @@ async def get_account_summary() -> dict:
 
 
 def _get_market_data_sync(d: dict) -> dict:
-    """Fetch live bid/ask/last for an options contract. Uses clientId=6 (free slot)."""
+    """
+    Fetch bid/ask/last for an options contract.
+    Tries live data first; falls back to 15-min delayed data if live returns nothing.
+    Uses clientId=6 (free slot).
+    """
     import math
     ib = IB()
     try:
@@ -400,18 +404,33 @@ def _get_market_data_sync(d: dict) -> dict:
         )
         if not ib.qualifyContracts(contract):
             return {"success": False, "error": "contract not found"}
-        ticker = ib.reqMktData(contract, "", False, False)
-        ib.sleep(6)
-        ib.cancelMktData(contract)
 
         def _clean(v):
             return round(v, 2) if (v is not None and not math.isnan(v) and v > 0) else None
 
+        # Try live first
+        ib.reqMarketDataType(1)
+        ticker = ib.reqMktData(contract, "", False, False)
+        ib.sleep(6)
+        bid, ask, last = _clean(ticker.bid), _clean(ticker.ask), _clean(ticker.last)
+        ib.cancelMktData(contract)
+
+        # If live returned nothing, fall back to delayed (no subscription needed)
+        delayed = False
+        if bid is None and ask is None and last is None:
+            ib.reqMarketDataType(3)
+            ticker = ib.reqMktData(contract, "", False, False)
+            ib.sleep(4)
+            bid, ask, last = _clean(ticker.bid), _clean(ticker.ask), _clean(ticker.last)
+            ib.cancelMktData(contract)
+            delayed = True
+
         return {
             "success": True,
-            "bid":  _clean(ticker.bid),
-            "ask":  _clean(ticker.ask),
-            "last": _clean(ticker.last),
+            "bid":     bid,
+            "ask":     ask,
+            "last":    last,
+            "delayed": delayed,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
