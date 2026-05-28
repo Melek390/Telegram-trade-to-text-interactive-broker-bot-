@@ -119,22 +119,26 @@ async def start_signal_listener(application, user_ids: list[int]) -> None:
     """
     Starts the Telethon client and blocks until disconnected.
     Called as an asyncio.create_task() inside PTB's event loop.
-    The listener.session file must already be authenticated.
+    Auto-reconnects on disconnect with 30s backoff.
     """
-    try:
-        client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
-        await client.start()
-    except Exception as e:
-        print(f"[signal_listener] Could not start Telethon client: {e}")
-        return
-
-    print(f"[signal_listener] Listening on channel {SIGNAL_CHANNEL}")
-
-    @client.on(events.NewMessage(chats=SIGNAL_CHANNEL))
-    async def on_new_message(event):
+    backoff = 30
+    while True:
         try:
-            await _handle_message(client, event.message, application, user_ids)
-        except Exception as e:
-            print(f"[signal_listener] Error handling message: {e}")
+            client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            await client.start()
 
-    await client.run_until_disconnected()
+            print(f"[signal_listener] Listening on channel {SIGNAL_CHANNEL}")
+
+            @client.on(events.NewMessage(chats=SIGNAL_CHANNEL))
+            async def on_new_message(event):
+                try:
+                    await _handle_message(client, event.message, application, user_ids)
+                except Exception as e:
+                    print(f"[signal_listener] Error handling message: {e}")
+
+            await client.run_until_disconnected()
+
+        except Exception as e:
+            print(f"[signal_listener] Disconnected ({e}), retrying in {backoff}s...")
+
+        await asyncio.sleep(backoff)
