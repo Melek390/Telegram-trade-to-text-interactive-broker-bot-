@@ -76,7 +76,8 @@ def _mkt_line(mkt: dict | None) -> str:
     if mkt.get("last") is not None: parts.append(f"Last ${mkt['last']:.2f}")
     if not parts:
         return ""
-    return f"Market  :  {' · '.join(parts)}\n"
+    label = "Market ~" if mkt.get("delayed") else "Market"
+    return f"{label}  :  {' · '.join(parts)}\n"
 
 
 def _price_line(d: dict) -> str:

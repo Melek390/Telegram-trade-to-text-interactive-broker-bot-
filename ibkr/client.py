@@ -387,34 +387,67 @@ async def get_account_summary() -> dict:
 
 def _get_market_data_sync(d: dict) -> dict:
     """
-    Fetch market price from account portfolio data — instant, no subscription needed.
-    Only returns data for contracts already held in the account.
+    Fetch market data for an options contract.
+    1. Try live reqMktData (works if OPRA subscription active).
+    2. Fall back to delayed reqMktData type 3 (free, 15-20 min delay).
+       Note: delayed data uses ticker.delayedBid/Ask/Last attributes.
+    3. Fall back to portfolio price (instant, works for held positions).
     Uses clientId=6 (free slot).
     """
     import math
     ib = IB()
     try:
         ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID + 5, timeout=10)
-        ib.sleep(1)  # let portfolio data arrive
+        contract = Option(
+            symbol=d["ticker"],
+            lastTradeDateOrContractMonth=d["expiry"].replace("-", ""),
+            strike=float(d["strike"]),
+            right=_RIGHT[d["option_type"].upper()],
+            exchange="SMART", currency="USD", multiplier="100",
+        )
+        if not ib.qualifyContracts(contract):
+            return {"success": False, "error": "contract not found"}
 
+        def _clean(v):
+            return round(v, 2) if (v is not None and not math.isnan(v) and v > 0) else None
+
+        # Try live data first (requires OPRA subscription)
+        ib.reqMarketDataType(1)
+        ticker = ib.reqMktData(contract, "", False, False)
+        ib.sleep(3)
+        bid  = _clean(ticker.bid)
+        ask  = _clean(ticker.ask)
+        last = _clean(ticker.last)
+        ib.cancelMktData(contract)
+
+        if bid is not None or ask is not None or last is not None:
+            return {"success": True, "bid": bid, "ask": ask, "last": last, "delayed": False}
+
+        # Fall back to delayed data (free, no subscription needed)
+        # Delayed data uses ticker.delayedBid/Ask/Last — different from live attributes
+        ib.reqMarketDataType(3)
+        ticker = ib.reqMktData(contract, "", False, False)
+        ib.sleep(4)
+        bid  = _clean(ticker.delayedBid)
+        ask  = _clean(ticker.delayedAsk)
+        last = _clean(ticker.delayedLast)
+        ib.cancelMktData(contract)
+
+        if bid is not None or ask is not None or last is not None:
+            return {"success": True, "bid": bid, "ask": ask, "last": last, "delayed": True}
+
+        # Last resort: portfolio price (instant, works for held positions)
         target_right  = _RIGHT[d["option_type"].upper()]
         target_expiry = d["expiry"].replace("-", "")
-
         for item in ib.portfolio():
             c = item.contract
             if (c.symbol == d["ticker"] and
                     c.right == target_right and
                     abs(c.strike - float(d["strike"])) < 0.01 and
                     c.lastTradeDateOrContractMonth == target_expiry and
-                    item.marketPrice > 0 and
-                    not math.isnan(item.marketPrice)):
-                return {
-                    "success": True,
-                    "bid":     None,
-                    "ask":     None,
-                    "last":    round(item.marketPrice, 2),
-                    "delayed": False,
-                }
+                    item.marketPrice > 0 and not math.isnan(item.marketPrice)):
+                return {"success": True, "bid": None, "ask": None,
+                        "last": round(item.marketPrice, 2), "delayed": False}
 
         return {"success": True, "bid": None, "ask": None, "last": None, "delayed": False}
     except Exception as e:
