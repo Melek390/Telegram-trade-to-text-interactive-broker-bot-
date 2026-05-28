@@ -387,51 +387,36 @@ async def get_account_summary() -> dict:
 
 def _get_market_data_sync(d: dict) -> dict:
     """
-    Fetch bid/ask/last for an options contract.
-    Tries live data first; falls back to 15-min delayed data if live returns nothing.
+    Fetch market price from account portfolio data — instant, no subscription needed.
+    Only returns data for contracts already held in the account.
     Uses clientId=6 (free slot).
     """
     import math
     ib = IB()
     try:
         ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID + 5, timeout=10)
-        contract = Option(
-            symbol=d["ticker"],
-            lastTradeDateOrContractMonth=d["expiry"].replace("-", ""),
-            strike=float(d["strike"]),
-            right=_RIGHT[d["option_type"].upper()],
-            exchange="SMART", currency="USD", multiplier="100",
-        )
-        if not ib.qualifyContracts(contract):
-            return {"success": False, "error": "contract not found"}
+        ib.sleep(1)  # let portfolio data arrive
 
-        def _clean(v):
-            return round(v, 2) if (v is not None and not math.isnan(v) and v > 0) else None
+        target_right  = _RIGHT[d["option_type"].upper()]
+        target_expiry = d["expiry"].replace("-", "")
 
-        # Try live first
-        ib.reqMarketDataType(1)
-        ticker = ib.reqMktData(contract, "", False, False)
-        ib.sleep(6)
-        bid, ask, last = _clean(ticker.bid), _clean(ticker.ask), _clean(ticker.last)
-        ib.cancelMktData(contract)
+        for item in ib.portfolio():
+            c = item.contract
+            if (c.symbol == d["ticker"] and
+                    c.right == target_right and
+                    abs(c.strike - float(d["strike"])) < 0.01 and
+                    c.lastTradeDateOrContractMonth == target_expiry and
+                    item.marketPrice > 0 and
+                    not math.isnan(item.marketPrice)):
+                return {
+                    "success": True,
+                    "bid":     None,
+                    "ask":     None,
+                    "last":    round(item.marketPrice, 2),
+                    "delayed": False,
+                }
 
-        # If live returned nothing, fall back to delayed (no subscription needed)
-        delayed = False
-        if bid is None and ask is None and last is None:
-            ib.reqMarketDataType(3)
-            ticker = ib.reqMktData(contract, "", False, False)
-            ib.sleep(4)
-            bid, ask, last = _clean(ticker.bid), _clean(ticker.ask), _clean(ticker.last)
-            ib.cancelMktData(contract)
-            delayed = True
-
-        return {
-            "success": True,
-            "bid":     bid,
-            "ask":     ask,
-            "last":    last,
-            "delayed": delayed,
-        }
+        return {"success": True, "bid": None, "ask": None, "last": None, "delayed": False}
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
