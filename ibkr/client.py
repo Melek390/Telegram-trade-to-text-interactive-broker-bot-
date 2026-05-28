@@ -401,7 +401,7 @@ def _get_market_data_sync(d: dict) -> dict:
         if not ib.qualifyContracts(contract):
             return {"success": False, "error": "contract not found"}
         ticker = ib.reqMktData(contract, "", False, False)
-        ib.sleep(3)
+        ib.sleep(6)
         ib.cancelMktData(contract)
 
         def _clean(v):
