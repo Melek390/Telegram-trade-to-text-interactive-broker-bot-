@@ -15,12 +15,20 @@ from telegram.ext import (
     filters,
 )
 
+from tg import callbacks as cb
 from tg.handlers import (
     TICKER, OPTION_TYPE, STRIKE, DATE, PRICE, QTY, CONFIRM,
     handle_entry, ticker_input, option_type_callback, strike_input,
     date_input, price_input, qty_input, confirm_callback,
     cancel_command, help_command, set_authorized_users,
+    sleep_command, details_command,
+    POS_CLOSE_INPUT, POS_CLOSE_CONFIRM,
+    positions_command, pos_close_select, pos_close_input, pos_close_confirm,
+    ORD_ACTION, ORD_NEW_PRICE, ORD_MODIFY_CONFIRM,
+    orders_command, ord_select, ord_action, ord_new_price, ord_modify_confirm,
+    sig_price_input, sig_confirm_callback,
 )
+from tg.signal_listener import start_signal_listener
 
 load_dotenv()
 
@@ -40,7 +48,13 @@ def main():
     user_ids = [int(uid.strip()) for uid in raw_ids.split(",") if uid.strip().isdigit()]
     set_authorized_users(user_ids)
 
-    app = Application.builder().token(bot_token).build()
+    async def post_init(application: Application) -> None:
+        if os.getenv("TELEGRAM_API_ID") and os.getenv("API_HASH"):
+            asyncio.create_task(start_signal_listener(application, user_ids))
+        else:
+            logger.warning("TELEGRAM_API_ID / API_HASH not set — signal listener disabled.")
+
+    app = Application.builder().token(bot_token).post_init(post_init).build()
 
     conv = ConversationHandler(
         entry_points=[
@@ -61,8 +75,43 @@ def main():
         per_message=False,
     )
 
+    pos_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"(?i)^open\s+positions?$"), positions_command)],
+        states={
+            POS_CLOSE_INPUT:   [CallbackQueryHandler(pos_close_select)],
+            POS_CLOSE_CONFIRM: [
+                CallbackQueryHandler(pos_close_confirm, pattern=f"^({cb.CONFIRM}|{cb.CANCEL}|{cb.CHANGE_PRICE})$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pos_close_input),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_command)],
+        allow_reentry=True,
+        per_message=False,
+    )
+
+    ord_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"(?i)^pending\s+orders?$"), orders_command)],
+        states={
+            ORD_ACTION: [CallbackQueryHandler(ord_action, pattern=f"^({cb.ORD_CANCEL}|{cb.ORD_MODIFY}|{cb.ORD_BACK}|{cb.CANCEL})$"),
+                         CallbackQueryHandler(ord_select, pattern=r"^osel:")],
+            ORD_NEW_PRICE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, ord_new_price)],
+            ORD_MODIFY_CONFIRM: [CallbackQueryHandler(ord_modify_confirm, pattern=f"^({cb.CONFIRM}|{cb.CANCEL})$")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_command)],
+        allow_reentry=True,
+        per_message=False,
+    )
+
     app.add_handler(conv)
+    app.add_handler(pos_conv)
+    app.add_handler(ord_conv)
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^details$"), details_command))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^sleep$"), sleep_command))
+    # Signal confirmation — uses sig_confirm/sig_cancel (no collision with existing flows)
+    app.add_handler(CallbackQueryHandler(sig_confirm_callback, pattern=f"^({cb.SIG_CONFIRM}|{cb.SIG_CANCEL}|{cb.SIG_CHANGE_PRICE})$"))
+    # Signal price input — last in group 0; only runs when user is not in any ConversationHandler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sig_price_input))
     logger.info("Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

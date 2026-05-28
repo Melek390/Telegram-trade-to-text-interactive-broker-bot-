@@ -84,14 +84,42 @@ def _place_order_sync(d: dict) -> dict:
             except ValueError:
                 order = MarketOrder(action=action, totalQuantity=d["size"])
 
+        # Codes to ignore: informational TIF notice + market data farm status messages
+        IGNORED_CODES = {
+            0,     # no error
+            10349, # TIF set to DAY (informational)
+            2100, 2101, 2102, 2103, 2104, 2105,  # market data farm
+            2106, 2107, 2108, 2109, 2110, 2119,  # market data farm
+            2158,  # sec-def data farm
+        }
+        captured_errors: list[str] = []
+
+        def _on_error(reqId, errorCode, errorString, contract):
+            if errorCode not in IGNORED_CODES:
+                captured_errors.append(f"Error {errorCode}: {errorString}")
+
+        ib.errorEvent += _on_error
         trade = ib.placeOrder(contract, order)
-        ib.sleep(2)
+        ib.sleep(6)
+        ib.errorEvent -= _on_error
+
+        # Also check advancedError and whyHeld fields
+        extra = []
+        if trade.orderStatus.whyHeld:
+            extra.append(f"Hold reason: {trade.orderStatus.whyHeld}")
+        if getattr(trade, 'advancedError', ''):
+            extra.append(trade.advancedError)
+
+        # captured_errors (from errorEvent) already covers everything in trade.log
+        all_reasons = captured_errors + extra
+        reason = " | ".join(all_reasons) if all_reasons else ""
 
         return {
             "success":  True,
             "order_id": trade.order.orderId,
             "status":   trade.orderStatus.status,
             "filled":   trade.orderStatus.filled,
+            "reason":   reason,
         }
 
     except ConnectionRefusedError:
@@ -144,6 +172,260 @@ async def get_position(d: dict) -> int:
         asyncio.set_event_loop(loop)
         try:
             return _get_position_sync(d)
+        finally:
+            loop.close()
+    return await asyncio.to_thread(_run)
+
+
+def _get_account_summary_sync() -> dict:
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID + 2, timeout=10)
+        ib.sleep(1)
+
+        vals = {v.tag: v.value for v in ib.accountValues() if v.currency in ("USD", "")}
+        positions = ib.positions()
+
+        return {
+            "success":      True,
+            "account":      vals.get("AccountCode", "—"),
+            "net_liq":      float(vals.get("NetLiquidation", 0)),
+            "avail_funds":  float(vals.get("AvailableFunds", 0)),
+            "cash":         float(vals.get("TotalCashValue", 0)),
+            "open_pos":     len(positions),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
+def _get_open_positions_sync() -> list:
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID + 3, timeout=10)
+        ib.sleep(1)
+        result = []
+        for pos in ib.positions():
+            c = pos.contract
+            if c.secType == "OPT" and pos.position != 0:
+                expiry = c.lastTradeDateOrContractMonth
+                if len(expiry) == 8:
+                    expiry = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
+                result.append({
+                    "ticker":      c.symbol,
+                    "option_type": "Call" if c.right == "C" else "Put",
+                    "strike":      c.strike,
+                    "expiry":      expiry,
+                    "qty":         int(pos.position),
+                    "avg_cost":    round(pos.avgCost / 100, 2),
+                })
+        return result
+    except Exception:
+        return []
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
+def _get_pending_orders_sync() -> list:
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID + 4, timeout=10)
+        ib.reqAllOpenOrders()
+        ib.sleep(2)
+        result = []
+        for trade in ib.openTrades():
+            o = trade.order
+            c = trade.contract
+            if c.secType != "OPT":
+                continue
+            expiry = c.lastTradeDateOrContractMonth
+            if len(expiry) == 8:
+                expiry = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
+            result.append({
+                "order_id":    o.orderId,
+                "action":      o.action.capitalize(),
+                "qty":         int(o.totalQuantity),
+                "ticker":      c.symbol,
+                "option_type": "Call" if c.right == "C" else "Put",
+                "strike":      c.strike,
+                "expiry":      expiry,
+                "order_type":  "limit" if o.orderType == "LMT" else "mkt",
+                "limit_price": o.lmtPrice if o.orderType == "LMT" else None,
+                "status":      trade.orderStatus.status,
+            })
+        return result
+    except Exception:
+        return []
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
+def _cancel_order_sync(order_id: int) -> dict:
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID, timeout=10)
+        # Direct protocol call — no reqAllOpenOrders (that rebinds orders and
+        # causes them to be cancelled when this short-lived session disconnects)
+        ib.client.cancelOrder(order_id, "")
+        ib.sleep(2)
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
+def _modify_order_sync(order_id: int, new_price, order_info: dict) -> dict:
+    """
+    Cancel the existing order then place a replacement with the new price.
+    order_info must contain: action, ticker, option_type, strike, expiry, qty
+    Avoids reqAllOpenOrders so surviving orders are not rebound to this session.
+    """
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID, timeout=10)
+
+        # Cancel original order directly by orderId
+        ib.client.cancelOrder(order_id, "")
+        ib.sleep(1)
+
+        # Build replacement contract
+        contract = Option(
+            symbol=order_info["ticker"],
+            lastTradeDateOrContractMonth=order_info["expiry"].replace("-", ""),
+            strike=float(order_info["strike"]),
+            right=_RIGHT[order_info["option_type"].upper()],
+            exchange="SMART",
+            currency="USD",
+            multiplier="100",
+        )
+        qualified = ib.qualifyContracts(contract)
+        if not qualified:
+            return {"success": False, "error": "Contract not found"}
+
+        action = order_info["action"].upper()
+
+        if new_price is None:
+            smart_type = "bid" if action == "BUY" else "mid"
+            try:
+                new_price = _resolve_bid_mid(ib, contract, smart_type)
+                order = LimitOrder(action=action, totalQuantity=order_info["qty"], lmtPrice=new_price)
+            except ValueError:
+                order = MarketOrder(action=action, totalQuantity=order_info["qty"])
+        else:
+            order = LimitOrder(action=action, totalQuantity=order_info["qty"], lmtPrice=new_price)
+
+        trade = ib.placeOrder(contract, order)
+        ib.sleep(4)
+        return {"success": True, "new_order_id": trade.order.orderId}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
+async def get_open_positions() -> list:
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return _get_open_positions_sync()
+        finally:
+            loop.close()
+    return await asyncio.to_thread(_run)
+
+
+async def get_pending_orders() -> list:
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return _get_pending_orders_sync()
+        finally:
+            loop.close()
+    return await asyncio.to_thread(_run)
+
+
+async def cancel_order(order_id: int) -> dict:
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return _cancel_order_sync(order_id)
+        finally:
+            loop.close()
+    return await asyncio.to_thread(_run)
+
+
+async def modify_order(order_id: int, new_price, order_info: dict) -> dict:
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return _modify_order_sync(order_id, new_price, order_info)
+        finally:
+            loop.close()
+    return await asyncio.to_thread(_run)
+
+
+async def get_account_summary() -> dict:
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return _get_account_summary_sync()
+        finally:
+            loop.close()
+    return await asyncio.to_thread(_run)
+
+
+def _get_market_data_sync(d: dict) -> dict:
+    """Fetch live bid/ask/last for an options contract. Uses clientId=6 (free slot)."""
+    import math
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID + 5, timeout=10)
+        contract = Option(
+            symbol=d["ticker"],
+            lastTradeDateOrContractMonth=d["expiry"].replace("-", ""),
+            strike=float(d["strike"]),
+            right=_RIGHT[d["option_type"].upper()],
+            exchange="SMART", currency="USD", multiplier="100",
+        )
+        if not ib.qualifyContracts(contract):
+            return {"success": False, "error": "contract not found"}
+        ticker = ib.reqMktData(contract, "", False, False)
+        ib.sleep(3)
+        ib.cancelMktData(contract)
+
+        def _clean(v):
+            return round(v, 2) if (v is not None and not math.isnan(v) and v > 0) else None
+
+        return {
+            "success": True,
+            "bid":  _clean(ticker.bid),
+            "ask":  _clean(ticker.ask),
+            "last": _clean(ticker.last),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+
+
+async def get_market_data(d: dict) -> dict:
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return _get_market_data_sync(d)
         finally:
             loop.close()
     return await asyncio.to_thread(_run)
