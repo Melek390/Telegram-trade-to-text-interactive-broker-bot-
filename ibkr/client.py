@@ -417,6 +417,7 @@ def _get_market_data_sync(d: dict) -> dict:
                         "last": round(item.marketPrice, 2), "delayed": False}
 
         # Step 2: qualify contract then try live/delayed reqMktData
+        # Try SMART first; fall back to CBOE with SPXW/SPX trading class for index options
         contract = Option(
             symbol=d["ticker"],
             lastTradeDateOrContractMonth=target_expiry,
@@ -425,7 +426,22 @@ def _get_market_data_sync(d: dict) -> dict:
             exchange="SMART", currency="USD", multiplier="100",
         )
         if not ib.qualifyContracts(contract):
-            return {"success": True, "bid": None, "ask": None, "last": None, "delayed": False}
+            qualified = False
+            for tc in ("SPXW", "SPX", "NDXP", "NDX"):
+                alt = Option(
+                    symbol=d["ticker"],
+                    lastTradeDateOrContractMonth=target_expiry,
+                    strike=float(d["strike"]),
+                    right=target_right,
+                    exchange="CBOE", currency="USD", multiplier="100",
+                    tradingClass=tc,
+                )
+                if ib.qualifyContracts(alt):
+                    contract = alt
+                    qualified = True
+                    break
+            if not qualified:
+                return {"success": True, "bid": None, "ask": None, "last": None, "delayed": False}
 
         # Live data (requires OPRA subscription)
         ib.reqMarketDataType(1)
