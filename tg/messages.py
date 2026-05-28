@@ -75,7 +75,7 @@ def _mkt_line(mkt: dict | None) -> str:
     if mkt.get("ask")  is not None: parts.append(f"Ask ${mkt['ask']:.2f}")
     if mkt.get("last") is not None: parts.append(f"Last ${mkt['last']:.2f}")
     if not parts:
-        return "Market  :  _no data (market closed)_\n"
+        return "Market  :  _no live data_\n"
     return f"Market  :  {' · '.join(parts)}\n"
 
 
